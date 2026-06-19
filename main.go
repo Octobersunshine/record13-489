@@ -2,9 +2,13 @@ package main
 
 import (
 	"log"
+	"os"
+	"os/signal"
 	"redpacket/config"
 	"redpacket/database"
 	"redpacket/handler"
+	"redpacket/service"
+	"syscall"
 
 	"github.com/gin-gonic/gin"
 )
@@ -13,6 +17,9 @@ func main() {
 	cfg := config.Load()
 
 	database.Init(cfg)
+
+	stopCh := make(chan struct{})
+	service.StartAutoRefundScheduler(30, stopCh)
 
 	r := gin.Default()
 
@@ -38,6 +45,7 @@ func main() {
 			activities.GET("", handler.ListActivities)
 			activities.GET("/:id", handler.GetActivity)
 			activities.GET("/:id/records", handler.GetRecords)
+			activities.POST("/:id/refund", handler.TriggerActivityRefund)
 		}
 
 		redpacket := api.Group("/redpacket")
@@ -45,11 +53,26 @@ func main() {
 			redpacket.POST("/grab", handler.GrabRedPacket)
 		}
 
+		refund := api.Group("/refunds")
+		{
+			refund.POST("/batch", handler.TriggerBatchRefund)
+			refund.GET("", handler.ListRefundRecords)
+		}
+
 		users := api.Group("/users")
 		{
 			users.GET("/:user_id/redpackets", handler.GetUserRedPackets)
 		}
 	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Println("Shutting down gracefully...")
+		close(stopCh)
+		os.Exit(0)
+	}()
 
 	log.Printf("Server starting on port %s...", cfg.ServerPort)
 	if err := r.Run(":" + cfg.ServerPort); err != nil {

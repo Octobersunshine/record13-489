@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"redpacket/database"
 	"redpacket/models"
@@ -13,11 +14,12 @@ import (
 )
 
 type CreateActivityReq struct {
-	Name      string    `json:"name" binding:"required"`
-	TotalAmount int64   `json:"total_amount" binding:"required,min=1"`
-	TotalCount  int     `json:"total_count" binding:"required,min=1"`
-	MinAmount   int64   `json:"min_amount" binding:"required,min=1"`
-	MaxAmount   int64   `json:"max_amount" binding:"required,min=1"`
+	Name        string    `json:"name" binding:"required"`
+	CreatorID   string    `json:"creator_id"`
+	TotalAmount int64     `json:"total_amount" binding:"required,min=1"`
+	TotalCount  int       `json:"total_count" binding:"required,min=1"`
+	MinAmount   int64     `json:"min_amount" binding:"required,min=1"`
+	MaxAmount   int64     `json:"max_amount" binding:"required,min=1"`
 	StartTime   time.Time `json:"start_time" binding:"required"`
 	EndTime     time.Time `json:"end_time" binding:"required"`
 }
@@ -41,17 +43,24 @@ func CreateActivity(req *CreateActivityReq) (*models.RedPacketActivity, error) {
 		return nil, errors.New("total_amount exceeds max_amount per packet capacity")
 	}
 
+	creatorID := req.CreatorID
+	if creatorID == "" {
+		creatorID = "system"
+	}
+
 	activity := &models.RedPacketActivity{
 		Name:            req.Name,
+		CreatorID:       creatorID,
 		TotalAmount:     req.TotalAmount,
 		TotalCount:      req.TotalCount,
 		RemainingAmount: req.TotalAmount,
 		RemainingCount:  req.TotalCount,
+		RefundedAmount:  0,
 		MinAmount:       req.MinAmount,
 		MaxAmount:       req.MaxAmount,
 		StartTime:       req.StartTime,
 		EndTime:         req.EndTime,
-		Status:          1,
+		Status:          models.ActivityStatusActive,
 	}
 
 	if err := database.DB.Create(activity).Error; err != nil {
@@ -76,7 +85,7 @@ func GrabRedPacket(req *GrabRedPacketReq) (*models.RedPacketRecord, error) {
 		if now.After(activity.EndTime) {
 			return errors.New("activity has already ended")
 		}
-		if activity.Status != 1 {
+		if activity.Status != models.ActivityStatusActive {
 			return errors.New("activity is not active")
 		}
 		if activity.RemainingCount <= 0 {
@@ -276,4 +285,172 @@ func GetUserRedPackets(userID string, page, pageSize int) ([]models.UserRedPacke
 		return nil, 0, err
 	}
 	return packets, total, nil
+}
+
+func generateRefundOrderNo() string {
+	now := time.Now()
+	n, _ := rand.Int(rand.Reader, big.NewInt(1000000))
+	return fmt.Sprintf("RF%s%06d", now.Format("20060102150405"), n.Int64())
+}
+
+func FindExpiredActivities() ([]models.RedPacketActivity, error) {
+	now := time.Now()
+	var activities []models.RedPacketActivity
+	err := database.DB.
+		Where("end_time < ? AND status = ? AND remaining_amount > 0", now, models.ActivityStatusActive).
+		Or("end_time < ? AND status = ? AND remaining_count > 0", now, models.ActivityStatusActive).
+		Find(&activities).Error
+	return activities, err
+}
+
+func ProcessActivityRefund(activityID uint) (*models.RefundRecord, error) {
+	var refundRecord *models.RefundRecord
+
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		var activity models.RedPacketActivity
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").First(&activity, activityID).Error; err != nil {
+			return errors.New("activity not found")
+		}
+
+		if activity.Status == models.ActivityStatusRefunded {
+			return errors.New("activity has already been refunded")
+		}
+		if activity.RemainingAmount <= 0 {
+			now := time.Now()
+			result := tx.Model(&activity).Updates(map[string]interface{}{
+				"status":      models.ActivityStatusClosed,
+				"refunded_at": now,
+			})
+			if result.Error != nil {
+				return result.Error
+			}
+			return errors.New("no remaining amount to refund, activity closed")
+		}
+
+		now := time.Now()
+		refundAmount := activity.RemainingAmount
+
+		refundRecord = &models.RefundRecord{
+			ActivityID:    activity.ID,
+			CreatorID:     activity.CreatorID,
+			RefundAmount:  refundAmount,
+			RefundOrderNo: generateRefundOrderNo(),
+			Status:        models.RefundStatusPending,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		if err := tx.Create(refundRecord).Error; err != nil {
+			return err
+		}
+
+		refundRecord.Status = models.RefundStatusSuccess
+		refundRecord.RefundedAt = &now
+		refundRecord.UpdatedAt = now
+		if err := tx.Save(refundRecord).Error; err != nil {
+			return err
+		}
+
+		result := tx.Model(&activity).
+			Where("id = ? AND status = ?", activity.ID, models.ActivityStatusActive).
+			Updates(map[string]interface{}{
+				"remaining_amount": int64(0),
+				"remaining_count":  int(0),
+				"refunded_amount":  refundAmount,
+				"status":           models.ActivityStatusRefunded,
+				"refunded_at":      now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return errors.New("failed to update activity status, refund rolled back")
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	return refundRecord, nil
+}
+
+func RunAutoRefund() (int, int64, error) {
+	activities, err := FindExpiredActivities()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	successCount := 0
+	var totalRefundAmount int64 = 0
+
+	for i := range activities {
+		activity := activities[i]
+		refundRec, err := ProcessActivityRefund(activity.ID)
+		if err != nil {
+			continue
+		}
+		successCount++
+		totalRefundAmount += refundRec.RefundAmount
+	}
+
+	return successCount, totalRefundAmount, nil
+}
+
+func StartAutoRefundScheduler(intervalSeconds int, stopCh <-chan struct{}) {
+	go func() {
+		log.Println("[RefundScheduler] Started, interval:", intervalSeconds, "seconds")
+
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Println("[RefundScheduler] Running initial refund scan...")
+			count, amount, err := RunAutoRefund()
+			if err != nil {
+				log.Printf("[RefundScheduler] Initial scan error: %v", err)
+			} else {
+				log.Printf("[RefundScheduler] Initial scan done: refunded %d activities, total amount: %d", count, amount)
+			}
+		}()
+
+		ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopCh:
+				log.Println("[RefundScheduler] Stopped")
+				return
+			case <-ticker.C:
+				log.Println("[RefundScheduler] Running scheduled refund scan...")
+				count, amount, err := RunAutoRefund()
+				if err != nil {
+					log.Printf("[RefundScheduler] Scheduled scan error: %v", err)
+				} else if count > 0 {
+					log.Printf("[RefundScheduler] Scheduled scan done: refunded %d activities, total amount: %d", count, amount)
+				} else {
+					log.Println("[RefundScheduler] Scheduled scan done: no expired activities found")
+				}
+			}
+		}
+	}()
+}
+
+func GetRefundRecords(activityID *uint, creatorID string, page, pageSize int) ([]models.RefundRecord, int64, error) {
+	var records []models.RefundRecord
+	var total int64
+
+	query := database.DB.Model(&models.RefundRecord{})
+	if activityID != nil {
+		query = query.Where("activity_id = ?", *activityID)
+	}
+	if creatorID != "" {
+		query = query.Where("creator_id = ?", creatorID)
+	}
+	query.Count(&total)
+
+	offset := (page - 1) * pageSize
+	if err := query.Order("created_at desc").Offset(offset).Limit(pageSize).Find(&records).Error; err != nil {
+		return nil, 0, err
+	}
+	return records, total, nil
 }

@@ -26,6 +26,7 @@ func Init(cfg *config.Config) {
 		&models.RedPacketActivity{},
 		&models.RedPacketRecord{},
 		&models.UserRedPacket{},
+		&models.RefundRecord{},
 	)
 	if err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)

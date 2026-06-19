@@ -156,3 +156,66 @@ func GetUserRedPackets(c *gin.Context) {
 		"page_size": pageSize,
 	})
 }
+
+func TriggerActivityRefund(c *gin.Context) {
+	idStr := c.Param("id")
+	activityID, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		Fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	refundRecord, err := service.ProcessActivityRefund(uint(activityID))
+	if err != nil {
+		Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	Success(c, refundRecord)
+}
+
+func TriggerBatchRefund(c *gin.Context) {
+	count, amount, err := service.RunAutoRefund()
+	if err != nil {
+		Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	Success(c, gin.H{
+		"refunded_count":  count,
+		"refunded_amount": amount,
+	})
+}
+
+func ListRefundRecords(c *gin.Context) {
+	var activityIDPtr *uint
+	activityIDStr := c.Query("activity_id")
+	if activityIDStr != "" {
+		activityID, err := strconv.ParseUint(activityIDStr, 10, 32)
+		if err == nil {
+			id := uint(activityID)
+			activityIDPtr = &id
+		}
+	}
+
+	creatorID := c.Query("creator_id")
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+
+	records, total, err := service.GetRefundRecords(activityIDPtr, creatorID, page, pageSize)
+	if err != nil {
+		Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	Success(c, gin.H{
+		"list":      records,
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+	})
+}
