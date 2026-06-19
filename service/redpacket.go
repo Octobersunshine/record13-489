@@ -85,6 +85,9 @@ func GrabRedPacket(req *GrabRedPacketReq) (*models.RedPacketRecord, error) {
 		if activity.RemainingAmount <= 0 {
 			return errors.New("red packet funds have been exhausted")
 		}
+		if activity.RemainingAmount < activity.MinAmount {
+			return errors.New("remaining amount is less than minimum amount, cannot grab")
+		}
 
 		var existingCount int64
 		tx.Model(&models.RedPacketRecord{}).
@@ -97,6 +100,34 @@ func GrabRedPacket(req *GrabRedPacketReq) (*models.RedPacketRecord, error) {
 		amount, err := calculateAmount(&activity)
 		if err != nil {
 			return err
+		}
+
+		if amount > activity.RemainingAmount {
+			return errors.New("calculated amount exceeds remaining amount")
+		}
+		if amount < activity.MinAmount && activity.RemainingCount > 1 {
+			return errors.New("calculated amount is less than minimum amount")
+		}
+
+		result := tx.Model(&models.RedPacketActivity{}).
+			Where("id = ? AND remaining_count >= 1 AND remaining_amount >= ?", activity.ID, amount).
+			Updates(map[string]interface{}{
+				"remaining_count":  gorm.Expr("remaining_count - 1"),
+				"remaining_amount": gorm.Expr("remaining_amount - ?", amount),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return errors.New("failed to grab red packet, please try again")
+		}
+
+		var updated models.RedPacketActivity
+		if err := tx.First(&updated, activity.ID).Error; err != nil {
+			return err
+		}
+		if updated.RemainingAmount < 0 {
+			return errors.New("remaining amount went negative, rolling back")
 		}
 
 		orderNo := generateOrderNo()
@@ -124,19 +155,6 @@ func GrabRedPacket(req *GrabRedPacketReq) (*models.RedPacketRecord, error) {
 			return err
 		}
 
-		result := tx.Model(&activity).
-			Where("remaining_count >= 1 AND remaining_amount >= ?", amount).
-			Updates(map[string]interface{}{
-				"remaining_count":  gorm.Expr("remaining_count - 1"),
-				"remaining_amount": gorm.Expr("remaining_amount - ?", amount),
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected == 0 {
-			return errors.New("failed to grab red packet, please try again")
-		}
-
 		return nil
 	})
 
@@ -153,27 +171,30 @@ func calculateAmount(activity *models.RedPacketActivity) (int64, error) {
 	maxAmount := activity.MaxAmount
 
 	if remainingCount == 1 {
+		if remainingAmount > maxAmount {
+			return maxAmount, nil
+		}
 		return remainingAmount, nil
 	}
 
-	lowerBound := minAmount
 	upperBound := maxAmount
-
-	maxAvg := (remainingAmount - int64(remainingCount-1)*minAmount)
-	if upperBound > maxAvg {
-		upperBound = maxAvg
+	maxPossible := remainingAmount - int64(remainingCount-1)*minAmount
+	if upperBound > maxPossible {
+		upperBound = maxPossible
 	}
 
-	minAvg := (remainingAmount - int64(remainingCount-1)*maxAmount)
-	if minAvg < minAmount {
-		minAvg = minAmount
-	}
-	if lowerBound < minAvg {
-		lowerBound = minAvg
+	lowerBound := minAmount
+	minPossible := remainingAmount - int64(remainingCount-1)*maxAmount
+	if minPossible > minAmount {
+		lowerBound = minPossible
 	}
 
 	if lowerBound > upperBound {
-		lowerBound = upperBound
+		upperBound = lowerBound
+	}
+
+	if upperBound <= 0 {
+		return 0, errors.New("no valid amount can be calculated, remaining pool insufficient")
 	}
 
 	rangeSize := upperBound - lowerBound + 1
